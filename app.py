@@ -4,16 +4,22 @@ import numpy as np
 import altair as alt
 from pathlib import Path
 
-# NOVO: Plotly + interpolação suave
+# Plotly + interpolação
 import plotly.graph_objects as go
 from scipy.interpolate import PchipInterpolator
 
 # =========================
 # THEME / CORES
 # =========================
-PRIMARY_COLORS = ["#08082a", "#dbdbdb", "#dfac16"]  # Conservador, Moderado, Agressivo
-SECONDARY_COLORS = ["#f7e4af", "#999999", "#c00000", "#dce6f2"]  # muitas linhas
-SELIC_COLOR = "#c00000"  # Selic anualizada (linha)
+PRIMARY_COLORS = ["#08082a", "#dbdbdb", "#dfac16"]  # Conservador, Moderado, Agressivo (antigo)
+SELIC_COLOR = "#c00000"
+
+# Ajuste solicitado: Moderado vermelho (em vez de cinza claro)
+CARTEIRA_COLOR = {
+    "Conservador": "#08082a",
+    "Moderado": "#c00000",     # vermelho
+    "Agressivo": "#dfac16",
+}
 
 st.set_page_config(page_title="Retorno Esperado", layout="wide")
 st.title("Retorno Esperado — Classes e Carteiras (condicional ao CDI)")
@@ -33,26 +39,16 @@ portfolios = {
 }
 carteira_order = ["Conservador", "Moderado", "Agressivo"]
 
-# Janela anual fixa (dias úteis)
 WINDOW_ANUAL = 252
-
-# cores para plotly por carteira
-CARTEIRA_COLOR = {
-    "Conservador": PRIMARY_COLORS[0],
-    "Moderado": PRIMARY_COLORS[1],
-    "Agressivo": PRIMARY_COLORS[2],
-}
 
 # =========================
 # FUNÇÕES
 # =========================
 def rolling_annual_factor(series: pd.Series, window: int) -> pd.Series:
-    """Fator anual rolling: exp(sum(log(1+r))) em janela 'window'. Ex: 1.13 = +13%."""
     s = pd.to_numeric(series, errors="coerce").fillna(0.0)
     return np.exp(np.log1p(s).rolling(window=window).sum())
 
 def calculate_metrics(factor_series: pd.Series, z: float = 1.645):
-    """Média e IC (média ± z*std) no espaço de FATOR (ex: 1.10)."""
     s = pd.to_numeric(factor_series, errors="coerce").dropna()
     if s.empty:
         return None
@@ -65,35 +61,25 @@ def calculate_metrics(factor_series: pd.Series, z: float = 1.645):
 def compute_everything(df_raw: pd.DataFrame, window: int) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # 1ª coluna = data
     date_col = df.columns[0]
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
 
-    # numéricos nas classes (retornos diários)
     df[assets] = df[assets].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    # Selic anualizada a partir do CDI diário:
-    # r_aa = (1 + r_dia) ^ 252 - 1
-    df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0  # em decimal (ex: 0.135)
-
-    # tendência da selic (subindo/caindo) pelo delta diário do anualizado
+    df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0
     df["SelicTrend"] = np.where(df["SelicAnualizada"].diff() >= 0, "Subindo", "Caindo")
 
-    # Base 100 das classes
     for col in assets:
         df[f"Base100_{col}"] = 100 * (1 + df[col]).cumprod()
 
-    # Carteiras: retorno diário, base 100 e anual rolling (fator)
     for name, wdict in portfolios.items():
         w = np.array([wdict.get(a, 0.0) for a in assets], dtype=float)
         df[f"Retorno_{name}"] = df[assets].values @ w
         df[f"Base100_{name}"] = 100 * (1 + df[f"Retorno_{name}"]).cumprod()
         df[f"FatorAnual_{name}"] = rolling_annual_factor(df[f"Retorno_{name}"], window=window)
 
-    # CDI anual rolling (fator) para bins
     df["CDIAcumuladoAnual"] = rolling_annual_factor(df["CDI"], window=window)
-
     return df
 
 def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645) -> pd.DataFrame:
@@ -133,17 +119,17 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645)
             results.append({
                 "CDI Range (% a.a.)": range_label_pct,
                 "_range_order": i,
-
-                # NOVO: midpoint numérico para permitir visualização contínua
                 "CDI Midpoint (% a.a.)": cdi_mid_pct,
 
                 "Carteira": name,
                 "Expected Return (% a.a.)": exp_pct,
                 "Lower Bound 90% (% a.a.)": lower_pct,
                 "Upper Bound 90% (% a.a.)": upper_pct,
+
                 "Expected Return (% do CDI)": exp_pct_cdi,
                 "Lower Bound (% do CDI)": lower_pct_cdi,
                 "Upper Bound (% do CDI)": upper_pct_cdi,
+
                 "Observações": nobs,
             })
 
@@ -151,11 +137,12 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645)
     if res.empty:
         return res
 
-    for c in [
+    num_cols = [
         "CDI Midpoint (% a.a.)",
         "Expected Return (% a.a.)", "Lower Bound 90% (% a.a.)", "Upper Bound 90% (% a.a.)",
-        "Expected Return (% do CDI)", "Lower Bound (% do CDI)", "Upper Bound (% do CDI)"
-    ]:
+        "Expected Return (% do CDI)", "Lower Bound (% do CDI)", "Upper Bound (% do CDI)",
+    ]
+    for c in num_cols:
         res[c] = pd.to_numeric(res[c], errors="coerce").round(2)
 
     res["Carteira"] = pd.Categorical(res["Carteira"], categories=carteira_order, ordered=True)
@@ -163,22 +150,17 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645)
     return res
 
 def add_smoothing_to_bins_table(res: pd.DataFrame, window_size: int) -> pd.DataFrame:
-    """
-    Aplica rolling mean (centered) nas séries de bins, separadamente por Carteira,
-    preservando exatamente a ideia do seu w=3/w=5 no nível do results_df.
-    """
     if res.empty:
         return res
 
     df = res.copy()
     df = df.sort_values(["Carteira", "_range_order"]).reset_index(drop=True)
 
-    # colunas para suavizar (em % do CDI)
     base_cols = [
         "Expected Return (% do CDI)",
         "Lower Bound (% do CDI)",
         "Upper Bound (% do CDI)",
-        # (Opcional) também podemos suavizar em % a.a.
+
         "Expected Return (% a.a.)",
         "Lower Bound 90% (% a.a.)",
         "Upper Bound 90% (% a.a.)",
@@ -196,7 +178,8 @@ def add_smoothing_to_bins_table(res: pd.DataFrame, window_size: int) -> pd.DataF
     return df
 
 def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -> alt.Chart:
-    color_scale = alt.Scale(domain=carteira_order, range=PRIMARY_COLORS)
+    # Altair: domínio em ordem + cores coerentes
+    color_scale = alt.Scale(domain=carteira_order, range=[CARTEIRA_COLOR[c] for c in carteira_order])
 
     bars = (
         alt.Chart(bar_long)
@@ -245,7 +228,8 @@ def make_base100_line_chart(df: pd.DataFrame, selected_assets: list[str]) -> alt
     date_col = long_df.columns[0]
     long_df = long_df.rename(columns={date_col: "data"})
 
-    palette = SECONDARY_COLORS + PRIMARY_COLORS
+    # cores simples (Altair)
+    palette = ["#f7e4af", "#999999", "#c00000", "#dce6f2"] + list(CARTEIRA_COLOR.values())
     colors = (palette * (len(selected_assets) // len(palette) + 1))[:len(selected_assets)]
     line_scale = alt.Scale(domain=selected_assets, range=colors)
 
@@ -266,11 +250,6 @@ def make_base100_line_chart(df: pd.DataFrame, selected_assets: list[str]) -> alt
     )
 
 def make_dual_axis_selic_base100(df: pd.DataFrame) -> alt.Chart:
-    """
-    Eixo esquerdo: Base100 das 3 carteiras
-    Eixo direito: SelicAnualizada (% a.a.)
-    """
-    # Base100 portfolios em formato long
     base_cols = [f"Base100_{n}" for n in carteira_order]
     tmp = df[base_cols].copy()
     tmp.columns = carteira_order
@@ -278,13 +257,11 @@ def make_dual_axis_selic_base100(df: pd.DataFrame) -> alt.Chart:
     date_col = long_base.columns[0]
     long_base = long_base.rename(columns={date_col: "data"})
 
-    # Selic anualizada (%)
     selic_df = df[["SelicAnualizada"]].copy()
     selic_df = selic_df.reset_index().rename(columns={selic_df.reset_index().columns[0]: "data"})
     selic_df["selic_aa_pct"] = selic_df["SelicAnualizada"] * 100.0
 
-    # Escalas de cor
-    port_color = alt.Scale(domain=carteira_order, range=PRIMARY_COLORS)
+    port_color = alt.Scale(domain=carteira_order, range=[CARTEIRA_COLOR[c] for c in carteira_order])
 
     base_lines = (
         alt.Chart(long_base)
@@ -328,12 +305,9 @@ def plot_continuo_plotly_from_bins(
     y_col: str,
     low_col: str,
     high_col: str,
-    title: str
+    title: str,
+    yaxis_title: str,
 ):
-    """
-    Gráfico contínuo interativo via PCHIP, com banda (low/high) e pontos dos bins.
-    Hover mostra média + min + max certinho (sem confusão de traces).
-    """
     sub = res_bins[res_bins["Carteira"] == carteira].copy()
     sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col, low_col, high_col])
 
@@ -346,10 +320,8 @@ def plot_continuo_plotly_from_bins(
     y_low = sub[low_col].to_numpy(dtype=float)
     y_high = sub[high_col].to_numpy(dtype=float)
 
-    # grid contínuo
     x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
 
-    # interpolação suave
     mean_spline = PchipInterpolator(x, y)
     low_spline = PchipInterpolator(x, y_low)
     high_spline = PchipInterpolator(x, y_high)
@@ -360,7 +332,7 @@ def plot_continuo_plotly_from_bins(
 
     fig = go.Figure()
 
-    # Banda (sem hover)
+    # Banda sem hover
     fig.add_trace(go.Scatter(
         x=x_grid, y=y_low_grid,
         mode="lines",
@@ -376,7 +348,7 @@ def plot_continuo_plotly_from_bins(
         hoverinfo="skip"
     ))
 
-    # Linha média: hover completo com min/max
+    # Linha com hover completo (média + min + max)
     custom_line = np.stack([y_low_grid, y_high_grid], axis=1)
     fig.add_trace(go.Scatter(
         x=x_grid, y=y_grid,
@@ -424,10 +396,11 @@ def plot_continuo_plotly_from_bins(
     fig.update_layout(
         title=title,
         xaxis_title="CDI midpoint (% a.a.)",
-        yaxis_title=y_col,
+        yaxis_title=yaxis_title,
         hovermode="x unified",
-        height=450,
+        height=420,
         margin=dict(l=20, r=20, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -475,37 +448,32 @@ bins = np.arange(1 + bin_start_pct/100.0, 1 + bin_end_pct/100.0 + 1e-9, bin_step
 st.sidebar.subheader("Regime de Selic (tendência)")
 trend_choice = st.sidebar.selectbox("Filtrar períodos por Selic", ["Todos", "Subindo", "Caindo"], index=0)
 
-# NOVO: controles da view contínua
-st.sidebar.subheader("View contínua (Plotly)")
-cont_metric = st.sidebar.selectbox(
-    "Métrica do gráfico contínuo",
-    ["% do CDI", "% a.a."],
+# NOVO (unificado): controles que afetam CONTÍNUO + BARRAS
+st.sidebar.subheader("Visualização: retorno base vs suavizado")
+vis_tipo = st.sidebar.radio("Tipo de retorno", ["Base", "Suavizado"], index=1, horizontal=True)
+
+vis_w = 5
+if vis_tipo == "Suavizado":
+    vis_w = st.sidebar.radio("Janela (w)", [3, 5], index=1, horizontal=True)
+
+st.sidebar.subheader("Visualização: métrica")
+vis_metric = st.sidebar.selectbox(
+    "Ver retornos como…",
+    ["% do CDI", "Retorno Esperado (% a.a.)"],
     index=0
 )
-
-cont_tipo = st.sidebar.radio(
-    "Retorno no gráfico contínuo",
-    ["Base", "Suavizado"],
-    index=1,
-    horizontal=True
-)
-
-cont_w = 5
-if cont_tipo == "Suavizado":
-    cont_w = st.sidebar.radio("Janela (w)", [3, 5], index=1, horizontal=True)
 
 # =========================
 # COMPUTE
 # =========================
 df = compute_everything(df_raw, window=WINDOW_ANUAL)
 
-# aplica filtro de tendência (para tabela/bins/barras)
 df_regime = df.copy()
 if trend_choice in ["Subindo", "Caindo"]:
     df_regime = df_regime[df_regime["SelicTrend"] == trend_choice]
 
 # =========================
-# 0) NOVO GRÁFICO: EIXO DUPLO (Selic anualizada + Base100 carteiras)
+# 0) EIXO DUPLO (Selic anualizada + Base100 carteiras)
 # =========================
 st.divider()
 st.subheader("Selic anualizada vs Base 100 das carteiras (eixo duplo)")
@@ -529,7 +497,7 @@ else:
     st.info("Selecione ao menos 1 classe para plotar.")
 
 # =========================
-# 2) TABELA + GRÁFICOS DE BARRAS
+# 2) TABELA + BARRAS (agora respeitam Base vs Suavizado e w)
 # =========================
 st.divider()
 st.subheader(f"Tabela — Retorno esperado por faixa de CDI anual  (Selic: {trend_choice})")
@@ -540,7 +508,6 @@ if results_df.empty:
     st.warning("Não houve observações suficientes nas faixas escolhidas (ou faltam dados na janela anual).")
     st.stop()
 
-# ordem correta dos ranges (menor -> maior)
 range_order = (
     results_df[["CDI Range (% a.a.)", "_range_order"]]
     .drop_duplicates()
@@ -548,127 +515,84 @@ range_order = (
     .tolist()
 )
 
-# tabela ordenada: range e carteira
 results_df_table = results_df.drop(columns=["_range_order"]).copy()
 results_df_table["Carteira"] = pd.Categorical(results_df_table["Carteira"], categories=carteira_order, ordered=True)
-results_df_table["CDI Range (% a.a.)"] = pd.Categorical(
-    results_df_table["CDI Range (% a.a.)"], categories=range_order, ordered=True
-)
+results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Range (% a.a.)"], categories=range_order, ordered=True)
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
 st.dataframe(results_df_table, use_container_width=True)
 
-# dataset para barras (com ordem numérica)
-bar_base = results_df[["CDI Range (% a.a.)", "_range_order", "Carteira",
-                       "Expected Return (% a.a.)", "Expected Return (% do CDI)"]].copy()
+# aplica suavização (se escolhido) para BARRAS + CONTÍNUO
+res_vis = results_df.copy()
+label_suffix = ""
+if vis_tipo == "Suavizado":
+    res_vis = add_smoothing_to_bins_table(res_vis, window_size=vis_w)
+    label_suffix = f" | Suavizado (w={vis_w})"
+else:
+    label_suffix = " | Base"
 
+# escolhe quais colunas entram nos gráficos (barras + contínuo)
+if vis_metric == "% do CDI":
+    if vis_tipo == "Base":
+        y_bar_col = "Expected Return (% do CDI)"
+        y_low_col = "Lower Bound (% do CDI)"
+        y_high_col = "Upper Bound (% do CDI)"
+        y_title = "Expected Return (% do CDI)"
+    else:
+        y_bar_col = f"Smoothed Expected Return (% do CDI) (w={vis_w})"
+        y_low_col = f"Smoothed Lower Bound (% do CDI) (w={vis_w})"
+        y_high_col = f"Smoothed Upper Bound (% do CDI) (w={vis_w})"
+        y_title = "Expected Return (% do CDI) — suavizado"
+else:
+    if vis_tipo == "Base":
+        y_bar_col = "Expected Return (% a.a.)"
+        y_low_col = "Lower Bound 90% (% a.a.)"
+        y_high_col = "Upper Bound 90% (% a.a.)"
+        y_title = "Expected Return (% a.a.)"
+    else:
+        y_bar_col = f"Smoothed Expected Return (% a.a.) (w={vis_w})"
+        y_low_col = f"Smoothed Lower Bound 90% (% a.a.) (w={vis_w})"
+        y_high_col = f"Smoothed Upper Bound 90% (% a.a.) (w={vis_w})"
+        y_title = "Expected Return (% a.a.) — suavizado"
+
+# prepara dataset de barras com a coluna correta
+bar_base = res_vis[["CDI Range (% a.a.)", "_range_order", "Carteira", y_bar_col]].copy()
 bar_base = bar_base.rename(columns={
     "CDI Range (% a.a.)": "cdi_range",
     "_range_order": "range_order",
     "Carteira": "portfolio",
-    "Expected Return (% a.a.)": "expected_return_aa",
-    "Expected Return (% do CDI)": "expected_return_cdi",
+    y_bar_col: "y_value",
 })
-
-for col in ["expected_return_aa", "expected_return_cdi"]:
-    bar_base[col] = pd.to_numeric(bar_base[col], errors="coerce")
-
-# força ordem do eixo X e da carteira
+bar_base["y_value"] = pd.to_numeric(bar_base["y_value"], errors="coerce")
 bar_base["cdi_range"] = pd.Categorical(bar_base["cdi_range"], categories=range_order, ordered=True)
 bar_base["portfolio"] = pd.Categorical(bar_base["portfolio"], categories=carteira_order, ordered=True)
 
-# GRÁFICO 1: % a.a.
-st.subheader("Barras agrupadas — Expected Return (% a.a.) por faixa de CDI")
-bar_aa = bar_base.dropna(subset=["expected_return_aa"]).copy()
-if bar_aa.empty:
-    st.warning("Sem dados válidos para o gráfico de % a.a. (verifique bins/janela).")
+st.subheader(f"Barras agrupadas — {vis_metric}{label_suffix}")
+bar_ok = bar_base.dropna(subset=["y_value"]).copy()
+if bar_ok.empty:
+    st.warning("Sem dados válidos para o gráfico de barras (verifique bins/janela).")
 else:
     st.altair_chart(
-        make_grouped_bar_chart(bar_aa, y_field="expected_return_aa", y_title="Expected Return (% a.a.)"),
-        use_container_width=True
-    )
-
-# GRÁFICO 2: % do CDI
-st.subheader("Barras agrupadas — Expected Return (% do CDI) por faixa de CDI")
-bar_cdi = bar_base.dropna(subset=["expected_return_cdi"]).copy()
-if bar_cdi.empty:
-    st.warning("Sem dados válidos para o gráfico de % do CDI (verifique bins/janela).")
-else:
-    st.altair_chart(
-        make_grouped_bar_chart(bar_cdi, y_field="expected_return_cdi", y_title="Expected Return (% do CDI)"),
+        make_grouped_bar_chart(bar_ok, y_field="y_value", y_title=y_title),
         use_container_width=True
     )
 
 # =========================
-# 3) NOVA VIEW — GRÁFICO CONTÍNUO (interativo)
+# 3) VIEW CONTÍNUA — agora um abaixo do outro
 # =========================
 st.divider()
 st.subheader("View contínua (interativa) — Retorno vs CDI (a partir dos bins)")
 
-# Escolha de base vs suavizado (w=3/w=5) aplicada AQUI
-res_for_plot = results_df.copy()
-suffix = ""
-
-if cont_tipo == "Suavizado":
-    res_for_plot = add_smoothing_to_bins_table(res_for_plot, window_size=cont_w)
-    suffix = f" | Suavizado (w={cont_w})"
-
-if cont_metric == "% do CDI":
-    if cont_tipo == "Base":
-        y_col = "Expected Return (% do CDI)"
-        low_col = "Lower Bound (% do CDI)"
-        high_col = "Upper Bound (% do CDI)"
-        y_label = "Expected Return (% do CDI)"
-    else:
-        y_col = f"Smoothed Expected Return (% do CDI) (w={cont_w})"
-        low_col = f"Smoothed Lower Bound (% do CDI) (w={cont_w})"
-        high_col = f"Smoothed Upper Bound (% do CDI) (w={cont_w})"
-        y_label = y_col
-else:
-    if cont_tipo == "Base":
-        y_col = "Expected Return (% a.a.)"
-        low_col = "Lower Bound 90% (% a.a.)"
-        high_col = "Upper Bound 90% (% a.a.)"
-        y_label = "Expected Return (% a.a.)"
-    else:
-        y_col = f"Smoothed Expected Return (% a.a.) (w={cont_w})"
-        low_col = f"Smoothed Lower Bound 90% (% a.a.) (w={cont_w})"
-        high_col = f"Smoothed Upper Bound 90% (% a.a.) (w={cont_w})"
-        y_label = y_col
-
-# Mostra 3 gráficos (A/B/C) em colunas
-c1, c2, c3 = st.columns(3)
-
-with c1:
+# plota verticalmente (um abaixo do outro)
+for carteira in carteira_order:
     plot_continuo_plotly_from_bins(
-        res_bins=res_for_plot,
-        carteira="Conservador",
+        res_bins=res_vis,
+        carteira=carteira,
         x_col="CDI Midpoint (% a.a.)",
-        y_col=y_col,
-        low_col=low_col,
-        high_col=high_col,
-        title=f"Conservador — {cont_metric}{suffix}"
-    )
-
-with c2:
-    plot_continuo_plotly_from_bins(
-        res_bins=res_for_plot,
-        carteira="Moderado",
-        x_col="CDI Midpoint (% a.a.)",
-        y_col=y_col,
-        low_col=low_col,
-        high_col=high_col,
-        title=f"Moderado — {cont_metric}{suffix}"
-    )
-
-with c3:
-    plot_continuo_plotly_from_bins(
-        res_bins=res_for_plot,
-        carteira="Agressivo",
-        x_col="CDI Midpoint (% a.a.)",
-        y_col=y_col,
-        low_col=low_col,
-        high_col=high_col,
-        title=f"Agressivo — {cont_metric}{suffix}"
+        y_col=y_bar_col,
+        low_col=y_low_col,
+        high_col=y_high_col,
+        title=f"{carteira} — {vis_metric}{label_suffix}",
+        yaxis_title=y_title
     )
 
 with st.expander("Diagnóstico (regime filtrado): colunas anuais usadas"):
