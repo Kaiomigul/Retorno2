@@ -4,6 +4,10 @@ import numpy as np
 import altair as alt
 from pathlib import Path
 
+# NOVO: Plotly + interpolação suave
+import plotly.graph_objects as go
+from scipy.interpolate import PchipInterpolator
+
 # =========================
 # THEME / CORES
 # =========================
@@ -31,6 +35,13 @@ carteira_order = ["Conservador", "Moderado", "Agressivo"]
 
 # Janela anual fixa (dias úteis)
 WINDOW_ANUAL = 252
+
+# cores para plotly por carteira
+CARTEIRA_COLOR = {
+    "Conservador": PRIMARY_COLORS[0],
+    "Moderado": PRIMARY_COLORS[1],
+    "Agressivo": PRIMARY_COLORS[2],
+}
 
 # =========================
 # FUNÇÕES
@@ -122,6 +133,10 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645)
             results.append({
                 "CDI Range (% a.a.)": range_label_pct,
                 "_range_order": i,
+
+                # NOVO: midpoint numérico para permitir visualização contínua
+                "CDI Midpoint (% a.a.)": cdi_mid_pct,
+
                 "Carteira": name,
                 "Expected Return (% a.a.)": exp_pct,
                 "Lower Bound 90% (% a.a.)": lower_pct,
@@ -136,13 +151,49 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float = 1.645)
     if res.empty:
         return res
 
-    for c in ["Expected Return (% a.a.)", "Lower Bound 90% (% a.a.)", "Upper Bound 90% (% a.a.)",
-              "Expected Return (% do CDI)", "Lower Bound (% do CDI)", "Upper Bound (% do CDI)"]:
+    for c in [
+        "CDI Midpoint (% a.a.)",
+        "Expected Return (% a.a.)", "Lower Bound 90% (% a.a.)", "Upper Bound 90% (% a.a.)",
+        "Expected Return (% do CDI)", "Lower Bound (% do CDI)", "Upper Bound (% do CDI)"
+    ]:
         res[c] = pd.to_numeric(res[c], errors="coerce").round(2)
 
     res["Carteira"] = pd.Categorical(res["Carteira"], categories=carteira_order, ordered=True)
     res = res.sort_values(["_range_order", "Carteira"])
     return res
+
+def add_smoothing_to_bins_table(res: pd.DataFrame, window_size: int) -> pd.DataFrame:
+    """
+    Aplica rolling mean (centered) nas séries de bins, separadamente por Carteira,
+    preservando exatamente a ideia do seu w=3/w=5 no nível do results_df.
+    """
+    if res.empty:
+        return res
+
+    df = res.copy()
+    df = df.sort_values(["Carteira", "_range_order"]).reset_index(drop=True)
+
+    # colunas para suavizar (em % do CDI)
+    base_cols = [
+        "Expected Return (% do CDI)",
+        "Lower Bound (% do CDI)",
+        "Upper Bound (% do CDI)",
+        # (Opcional) também podemos suavizar em % a.a.
+        "Expected Return (% a.a.)",
+        "Lower Bound 90% (% a.a.)",
+        "Upper Bound 90% (% a.a.)",
+    ]
+
+    for col in base_cols:
+        sm_col = f"Smoothed {col} (w={window_size})"
+        df[sm_col] = (
+            df.groupby("Carteira", sort=False)[col]
+              .apply(lambda s: s.rolling(window=window_size, min_periods=1, center=True).mean())
+              .reset_index(level=0, drop=True)
+              .round(2)
+        )
+
+    return df
 
 def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -> alt.Chart:
     color_scale = alt.Scale(domain=carteira_order, range=PRIMARY_COLORS)
@@ -270,6 +321,117 @@ def make_dual_axis_selic_base100(df: pd.DataFrame) -> alt.Chart:
         .properties(height=520, title="Selic anualizada (eixo direito) vs Base 100 das carteiras (eixo esquerdo)")
     )
 
+def plot_continuo_plotly_from_bins(
+    res_bins: pd.DataFrame,
+    carteira: str,
+    x_col: str,
+    y_col: str,
+    low_col: str,
+    high_col: str,
+    title: str
+):
+    """
+    Gráfico contínuo interativo via PCHIP, com banda (low/high) e pontos dos bins.
+    Hover mostra média + min + max certinho (sem confusão de traces).
+    """
+    sub = res_bins[res_bins["Carteira"] == carteira].copy()
+    sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col, low_col, high_col])
+
+    if len(sub) < 2:
+        st.warning(f"{carteira}: poucos pontos para interpolar (precisa de >= 2 bins com dados).")
+        return
+
+    x = sub[x_col].to_numpy(dtype=float)
+    y = sub[y_col].to_numpy(dtype=float)
+    y_low = sub[low_col].to_numpy(dtype=float)
+    y_high = sub[high_col].to_numpy(dtype=float)
+
+    # grid contínuo
+    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
+
+    # interpolação suave
+    mean_spline = PchipInterpolator(x, y)
+    low_spline = PchipInterpolator(x, y_low)
+    high_spline = PchipInterpolator(x, y_high)
+
+    y_grid = mean_spline(x_grid)
+    y_low_grid = low_spline(x_grid)
+    y_high_grid = high_spline(x_grid)
+
+    fig = go.Figure()
+
+    # Banda (sem hover)
+    fig.add_trace(go.Scatter(
+        x=x_grid, y=y_low_grid,
+        mode="lines",
+        line=dict(width=0),
+        hoverinfo="skip",
+        showlegend=False
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_grid, y=y_high_grid,
+        mode="lines",
+        fill="tonexty",
+        name="Banda",
+        hoverinfo="skip"
+    ))
+
+    # Linha média: hover completo com min/max
+    custom_line = np.stack([y_low_grid, y_high_grid], axis=1)
+    fig.add_trace(go.Scatter(
+        x=x_grid, y=y_grid,
+        mode="lines",
+        name="Linha (contínua)",
+        line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
+        customdata=custom_line,
+        hovertemplate=(
+            f"{carteira}<br>"
+            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+            "Média: %{y:.2f}<br>"
+            "Min (Lower): %{customdata[0]:.2f}<br>"
+            "Max (Upper): %{customdata[1]:.2f}"
+            "<extra></extra>"
+        )
+    ))
+
+    # Pontos (bins)
+    custom_pts = np.stack([
+        sub["CDI Range (% a.a.)"].astype(str).to_numpy(),
+        sub["Observações"].to_numpy(),
+        sub[low_col].to_numpy(),
+        sub[high_col].to_numpy(),
+    ], axis=1)
+
+    fig.add_trace(go.Scatter(
+        x=sub[x_col],
+        y=sub[y_col],
+        mode="markers",
+        name="Pontos (bins)",
+        marker=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), size=7),
+        customdata=custom_pts,
+        hovertemplate=(
+            f"{carteira}<br>"
+            "CDI Range: %{customdata[0]}<br>"
+            "Obs: %{customdata[1]}<br>"
+            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+            "Média: %{y:.2f}<br>"
+            "Min (Lower): %{customdata[2]:.2f}<br>"
+            "Max (Upper): %{customdata[3]:.2f}"
+            "<extra></extra>"
+        )
+    ))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="CDI midpoint (% a.a.)",
+        yaxis_title=y_col,
+        hovermode="x unified",
+        height=450,
+        margin=dict(l=20, r=20, t=60, b=30),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 # =========================
 # LOAD
 # =========================
@@ -312,6 +474,25 @@ bins = np.arange(1 + bin_start_pct/100.0, 1 + bin_end_pct/100.0 + 1e-9, bin_step
 
 st.sidebar.subheader("Regime de Selic (tendência)")
 trend_choice = st.sidebar.selectbox("Filtrar períodos por Selic", ["Todos", "Subindo", "Caindo"], index=0)
+
+# NOVO: controles da view contínua
+st.sidebar.subheader("View contínua (Plotly)")
+cont_metric = st.sidebar.selectbox(
+    "Métrica do gráfico contínuo",
+    ["% do CDI", "% a.a."],
+    index=0
+)
+
+cont_tipo = st.sidebar.radio(
+    "Retorno no gráfico contínuo",
+    ["Base", "Suavizado"],
+    index=1,
+    horizontal=True
+)
+
+cont_w = 5
+if cont_tipo == "Suavizado":
+    cont_w = st.sidebar.radio("Janela (w)", [3, 5], index=1, horizontal=True)
 
 # =========================
 # COMPUTE
@@ -415,6 +596,79 @@ else:
     st.altair_chart(
         make_grouped_bar_chart(bar_cdi, y_field="expected_return_cdi", y_title="Expected Return (% do CDI)"),
         use_container_width=True
+    )
+
+# =========================
+# 3) NOVA VIEW — GRÁFICO CONTÍNUO (interativo)
+# =========================
+st.divider()
+st.subheader("View contínua (interativa) — Retorno vs CDI (a partir dos bins)")
+
+# Escolha de base vs suavizado (w=3/w=5) aplicada AQUI
+res_for_plot = results_df.copy()
+suffix = ""
+
+if cont_tipo == "Suavizado":
+    res_for_plot = add_smoothing_to_bins_table(res_for_plot, window_size=cont_w)
+    suffix = f" | Suavizado (w={cont_w})"
+
+if cont_metric == "% do CDI":
+    if cont_tipo == "Base":
+        y_col = "Expected Return (% do CDI)"
+        low_col = "Lower Bound (% do CDI)"
+        high_col = "Upper Bound (% do CDI)"
+        y_label = "Expected Return (% do CDI)"
+    else:
+        y_col = f"Smoothed Expected Return (% do CDI) (w={cont_w})"
+        low_col = f"Smoothed Lower Bound (% do CDI) (w={cont_w})"
+        high_col = f"Smoothed Upper Bound (% do CDI) (w={cont_w})"
+        y_label = y_col
+else:
+    if cont_tipo == "Base":
+        y_col = "Expected Return (% a.a.)"
+        low_col = "Lower Bound 90% (% a.a.)"
+        high_col = "Upper Bound 90% (% a.a.)"
+        y_label = "Expected Return (% a.a.)"
+    else:
+        y_col = f"Smoothed Expected Return (% a.a.) (w={cont_w})"
+        low_col = f"Smoothed Lower Bound 90% (% a.a.) (w={cont_w})"
+        high_col = f"Smoothed Upper Bound 90% (% a.a.) (w={cont_w})"
+        y_label = y_col
+
+# Mostra 3 gráficos (A/B/C) em colunas
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    plot_continuo_plotly_from_bins(
+        res_bins=res_for_plot,
+        carteira="Conservador",
+        x_col="CDI Midpoint (% a.a.)",
+        y_col=y_col,
+        low_col=low_col,
+        high_col=high_col,
+        title=f"Conservador — {cont_metric}{suffix}"
+    )
+
+with c2:
+    plot_continuo_plotly_from_bins(
+        res_bins=res_for_plot,
+        carteira="Moderado",
+        x_col="CDI Midpoint (% a.a.)",
+        y_col=y_col,
+        low_col=low_col,
+        high_col=high_col,
+        title=f"Moderado — {cont_metric}{suffix}"
+    )
+
+with c3:
+    plot_continuo_plotly_from_bins(
+        res_bins=res_for_plot,
+        carteira="Agressivo",
+        x_col="CDI Midpoint (% a.a.)",
+        y_col=y_col,
+        low_col=low_col,
+        high_col=high_col,
+        title=f"Agressivo — {cont_metric}{suffix}"
     )
 
 with st.expander("Diagnóstico (regime filtrado): colunas anuais usadas"):
