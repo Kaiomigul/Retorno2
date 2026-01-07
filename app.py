@@ -61,32 +61,25 @@ def calculate_metrics(factor_series: pd.Series, z: float):
 def compute_everything(df_raw: pd.DataFrame, window: int) -> pd.DataFrame:
     df = df_raw.copy()
 
-    # 1ª coluna = data
     date_col = df.columns[0]
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
 
-    # numéricos nas classes
     df[assets] = df[assets].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    # Selic anualizada a partir do CDI diário
     df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0
     df["SelicTrend"] = np.where(df["SelicAnualizada"].diff() >= 0, "Subindo", "Caindo")
 
-    # Base 100 das classes
     for col in assets:
         df[f"Base100_{col}"] = 100 * (1 + df[col]).cumprod()
 
-    # Carteiras: retorno diário, base100 e fator anual rolling
     for name, wdict in portfolios.items():
         w = np.array([wdict.get(a, 0.0) for a in assets], dtype=float)
         df[f"Retorno_{name}"] = df[assets].values @ w
         df[f"Base100_{name}"] = 100 * (1 + df[f"Retorno_{name}"]).cumprod()
         df[f"FatorAnual_{name}"] = rolling_annual_factor(df[f"Retorno_{name}"], window=window)
 
-    # CDI anual rolling (fator) para bins
     df["CDIAcumuladoAnual"] = rolling_annual_factor(df["CDI"], window=window)
-
     return df
 
 def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.DataFrame:
@@ -116,7 +109,6 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.D
             lower_pct = (lower_factor - 1.0) * 100.0
             upper_pct = (upper_factor - 1.0) * 100.0
 
-            # %CDI base (apenas informativo; visão usa derivação consistente)
             if cdi_mid_pct != 0:
                 exp_pct_cdi = (exp_pct / cdi_mid_pct) * 100.0
                 lower_pct_cdi = (lower_pct / cdi_mid_pct) * 100.0
@@ -228,10 +220,6 @@ def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -
     return bars + labels
 
 def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
-    """
-    Eixo esquerdo: Base100 das 3 carteiras + Base100 do CDI
-    Eixo direito: SelicAnualizada (% a.a.)
-    """
     base_cols = [f"Base100_{n}" for n in carteira_order] + ["Base100_CDI"]
     tmp = df[base_cols].copy()
     tmp.columns = carteira_order + ["CDI"]
@@ -291,6 +279,18 @@ def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
         .properties(height=520, title="Base 100 (Carteiras + CDI) e Selic anualizada (eixo direito)")
     )
 
+# --- helper robusto: prepara x,y sem NaN e sem duplicatas ---
+def _prepare_xy_unique(sub: pd.DataFrame, x_col: str, y_col: str) -> pd.DataFrame:
+    tmp = sub[[x_col, y_col]].copy()
+    tmp[x_col] = pd.to_numeric(tmp[x_col], errors="coerce")
+    tmp[y_col] = pd.to_numeric(tmp[y_col], errors="coerce")
+    tmp = tmp.dropna(subset=[x_col, y_col])
+
+    # remove duplicatas de x (se acontecer) tomando a média do y
+    tmp = tmp.groupby(x_col, as_index=False)[y_col].mean()
+    tmp = tmp.sort_values(x_col).reset_index(drop=True)
+    return tmp
+
 def plot_continuo_plotly_from_bins(
     res_bins: pd.DataFrame,
     carteira: str,
@@ -306,8 +306,29 @@ def plot_continuo_plotly_from_bins(
     sub = res_bins[res_bins["Carteira"] == carteira].copy()
     sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col, low_col, high_col])
 
-    if len(sub) < 2:
-        st.warning(f"{carteira}: poucos pontos para interpolar (precisa de >= 2 bins com dados).")
+    # garante numérico e remove duplicata no x também para low/high (fazendo média)
+    sub[x_col] = pd.to_numeric(sub[x_col], errors="coerce")
+    sub[y_col] = pd.to_numeric(sub[y_col], errors="coerce")
+    sub[low_col] = pd.to_numeric(sub[low_col], errors="coerce")
+    sub[high_col] = pd.to_numeric(sub[high_col], errors="coerce")
+    sub = sub.dropna(subset=[x_col, y_col, low_col, high_col])
+
+    if sub.empty:
+        st.warning(f"{carteira}: sem pontos válidos após filtros.")
+        return
+
+    # dedup por x (média)
+    sub = sub.groupby(x_col, as_index=False).agg({
+        y_col: "mean",
+        low_col: "mean",
+        high_col: "mean",
+        "CDI Range (% a.a.)": "first",
+        "Observações": "sum",
+        "_range_order": "min"
+    }).sort_values(x_col).reset_index(drop=True)
+
+    if sub[x_col].nunique() < 2:
+        st.warning(f"{carteira}: precisa de >=2 pontos (x únicos) para interpolar.")
         return
 
     x = sub[x_col].to_numpy(dtype=float)
@@ -327,7 +348,6 @@ def plot_continuo_plotly_from_bins(
 
     fig = go.Figure()
 
-    # Banda sem hover
     fig.add_trace(go.Scatter(
         x=x_grid, y=y_low_grid,
         mode="lines",
@@ -405,23 +425,41 @@ def plot_continuo_plotly_from_bins(
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, title: str, yaxis_title: str, cdi_esperado_pct: float | None = None):
+# ✅ AQUI está a correção que resolve seu erro:
+def plot_all_three_lines_no_ic(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: float | None = None
+):
     fig = go.Figure()
+    any_trace = False
 
     for carteira in carteira_order:
         sub = res_bins[res_bins["Carteira"] == carteira].copy()
-        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
-        if len(sub) < 2:
+        sub = sub.sort_values("_range_order")
+
+        tmp = _prepare_xy_unique(sub, x_col, y_col)
+
+        # precisa de >= 2 pontos únicos
+        if tmp.shape[0] < 2:
             continue
 
-        x = sub[x_col].to_numpy(dtype=float)
-        y = sub[y_col].to_numpy(dtype=float)
+        x = tmp[x_col].to_numpy(dtype=float)
+        y = tmp[y_col].to_numpy(dtype=float)
 
-        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
-        y_grid = PchipInterpolator(x, y)(x_grid)
+        # grid e PCHIP
+        x_grid = np.linspace(float(x.min()), float(x.max()), 300)
+
+        try:
+            y_grid = PchipInterpolator(x, y)(x_grid)
+        except Exception as e:
+            st.warning(f"Falha ao interpolar {carteira} (provável x duplicado ou inválido): {e}")
+            continue
 
         fig.add_trace(go.Scatter(
             x=x_grid, y=y_grid,
@@ -435,6 +473,11 @@ def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, t
                 "<extra></extra>"
             )
         ))
+        any_trace = True
+
+    if not any_trace:
+        st.warning("Sem pontos suficientes para montar o comparativo (precisa de >=2 bins válidos por carteira).")
+        return
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
         fig.add_vline(
@@ -455,20 +498,32 @@ def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, t
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_col: str, title: str, yaxis_title: str, cdi_esperado_pct: float | None = None):
+def plot_all_three_lines_linear_endpoints(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: float | None = None
+):
     fig = go.Figure()
+    any_trace = False
 
     for carteira in carteira_order:
         sub = res_bins[res_bins["Carteira"] == carteira].copy()
-        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
-        if len(sub) < 2:
+        sub = sub.sort_values("_range_order")
+
+        tmp = _prepare_xy_unique(sub, x_col, y_col)
+        if tmp.shape[0] < 2:
             continue
 
-        x0 = float(sub[x_col].iloc[0]); y0 = float(sub[y_col].iloc[0])
-        x1 = float(sub[x_col].iloc[-1]); y1 = float(sub[y_col].iloc[-1])
+        x0 = float(tmp[x_col].iloc[0]); y0 = float(tmp[y_col].iloc[0])
+        x1 = float(tmp[x_col].iloc[-1]); y1 = float(tmp[y_col].iloc[-1])
+
+        if x1 == x0:
+            continue
 
         x_grid = np.linspace(x0, x1, 300)
         y_grid = y0 + (y1 - y0) * (x_grid - x0) / (x1 - x0)
@@ -485,6 +540,11 @@ def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_
                 "<extra></extra>"
             )
         ))
+        any_trace = True
+
+    if not any_trace:
+        st.warning("Sem pontos suficientes para montar o comparativo (reta).")
+        return
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
         fig.add_vline(
@@ -505,7 +565,6 @@ def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
@@ -540,7 +599,6 @@ df_full = compute_everything(df_raw, window=WINDOW_ANUAL)
 # =========================
 st.sidebar.header("Parâmetros")
 
-# ✅ NOVO: data inicial
 min_date = df_full.index.min().date()
 max_date = df_full.index.max().date()
 
@@ -590,7 +648,6 @@ vis_metric = st.sidebar.selectbox("Ver retornos como…", ["% do CDI", "Retorno 
 # =========================
 df = df_full[df_full.index >= start_ts].copy()
 
-# filtro de tendência
 df_regime = df.copy()
 if trend_choice in ["Subindo", "Caindo"]:
     df_regime = df_regime[df_regime["SelicTrend"] == trend_choice]
@@ -613,11 +670,9 @@ if results_df_base.empty:
     st.warning("Não houve observações suficientes nas faixas escolhidas (ou faltam dados na janela anual).")
     st.stop()
 
-# visão VIS consistente
 res_vis = prepare_visual_table_consistent(results_df_base, vis_tipo=vis_tipo, vis_w=vis_w)
 label_suffix = " | Base" if vis_tipo == "Base" else f" | Suavizado (w={vis_w})"
 
-# ordem dos ranges
 range_order = (
     results_df_base[["CDI Range (% a.a.)", "_range_order"]]
     .drop_duplicates()
@@ -625,7 +680,6 @@ range_order = (
     .tolist()
 )
 
-# tabela (arredonda só pra exibir)
 table_cols = [
     "CDI Range (% a.a.)",
     "Carteira",
@@ -648,7 +702,6 @@ results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Ra
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
 st.dataframe(results_df_table, use_container_width=True)
 
-# seleciona métrica VIS
 if vis_metric == "% do CDI":
     y_col = "VIS Expected Return (% do CDI)"
     low_col = "VIS Lower Bound (% do CDI)"
@@ -662,7 +715,6 @@ else:
     y_title = "Expected Return (% a.a.)"
     final_title = "Retorno esperado (% a.a.)"
 
-# barras
 bar_base = res_vis[["CDI Range (% a.a.)", "_range_order", "Carteira", y_col]].copy()
 bar_base = bar_base.rename(columns={
     "CDI Range (% a.a.)": "cdi_range",
@@ -734,4 +786,3 @@ plot_all_three_lines_linear_endpoints(
 with st.expander("Diagnóstico (regime filtrado): colunas anuais usadas"):
     cols_diag = ["CDIAcumuladoAnual", "SelicAnualizada", "SelicTrend"] + [f"FatorAnual_{n}" for n in carteira_order]
     st.dataframe(df_regime[cols_diag].dropna().head(50), use_container_width=True)
-
