@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import altair as alt
 from pathlib import Path
+from typing import Optional
 
 # Plotly
 import plotly.graph_objects as go
@@ -22,6 +23,9 @@ CARTEIRA_COLOR = {
 
 CDI_BASE100_COLOR = "#444444"  # CDI no gráfico Base100
 
+# =========================
+# APP
+# =========================
 st.set_page_config(page_title="Retorno Esperado", layout="wide")
 st.title("Retorno Esperado — Classes e Carteiras (condicional ao CDI)")
 
@@ -39,16 +43,20 @@ portfolios = {
     'Agressivo':   {'RV Brasil': 0.20, 'CDI': 0.05, 'IRFM': 0.10, 'IMAB': 0.25, 'IDA': 0.20, 'AGG Hedge': 0.00, 'SPY Hedge': 0.00, 'AGG': 0.05, 'SPY': 0.15},
 }
 carteira_order = ["Conservador", "Moderado", "Agressivo"]
+
+# Janela anual fixa (dias úteis)
 WINDOW_ANUAL = 252
 
 # =========================
 # FUNÇÕES
 # =========================
 def rolling_annual_factor(series: pd.Series, window: int) -> pd.Series:
+    """Fator anual rolling: exp(sum(log(1+r))) em janela 'window'. Ex: 1.13 = +13%."""
     s = pd.to_numeric(series, errors="coerce").fillna(0.0)
     return np.exp(np.log1p(s).rolling(window=window).sum())
 
 def calculate_metrics(factor_series: pd.Series, z: float):
+    """Média e IC (média ± z*std) no espaço de FATOR (ex: 1.10)."""
     s = pd.to_numeric(factor_series, errors="coerce").dropna()
     if s.empty:
         return None
@@ -66,25 +74,27 @@ def compute_everything(df_raw: pd.DataFrame, window: int) -> pd.DataFrame:
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
 
-    # numéricos nas classes
+    # numéricos nas classes (retornos diários)
     df[assets] = df[assets].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    # Selic anualizada
-    df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0
+    # Selic anualizada a partir do CDI diário: r_aa = (1 + r_dia) ^ 252 - 1
+    df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0  # decimal (ex: 0.135)
+
+    # tendência da selic (subindo/caindo) pelo delta diário do anualizado
     df["SelicTrend"] = np.where(df["SelicAnualizada"].diff() >= 0, "Subindo", "Caindo")
 
     # Base 100 das classes
     for col in assets:
         df[f"Base100_{col}"] = 100 * (1 + df[col]).cumprod()
 
-    # Carteiras: retorno diário, base100 e fator anual rolling
+    # Carteiras: retorno diário, base 100 e anual rolling (fator)
     for name, wdict in portfolios.items():
         w = np.array([wdict.get(a, 0.0) for a in assets], dtype=float)
         df[f"Retorno_{name}"] = df[assets].values @ w
         df[f"Base100_{name}"] = 100 * (1 + df[f"Retorno_{name}"]).cumprod()
         df[f"FatorAnual_{name}"] = rolling_annual_factor(df[f"Retorno_{name}"], window=window)
 
-    # CDI anual rolling (fator) para bins
+    # CDI anual rolling (fator) para bins e para %CDI histórico
     df["CDIAcumuladoAnual"] = rolling_annual_factor(df["CDI"], window=window)
 
     return df
@@ -116,7 +126,7 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.D
             lower_pct = (lower_factor - 1.0) * 100.0
             upper_pct = (upper_factor - 1.0) * 100.0
 
-            # %CDI base apenas informativo (a VISÃO vai derivar de forma consistente)
+            # %CDI "base" (mantemos por auditoria; as colunas VIS serão consistentes)
             if cdi_mid_pct != 0:
                 exp_pct_cdi = (exp_pct / cdi_mid_pct) * 100.0
                 lower_pct_cdi = (lower_pct / cdi_mid_pct) * 100.0
@@ -128,7 +138,6 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.D
                 "CDI Range (% a.a.)": range_label_pct,
                 "_range_order": i,
                 "CDI Midpoint (% a.a.)": cdi_mid_pct,
-
                 "Carteira": name,
 
                 "Expected Return (% a.a.)": exp_pct,
@@ -146,12 +155,11 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.D
     if res.empty:
         return res
 
-    num_cols = [
+    for c in [
         "CDI Midpoint (% a.a.)",
         "Expected Return (% a.a.)", "Lower Bound (% a.a.)", "Upper Bound (% a.a.)",
         "Expected Return (% do CDI)_base", "Lower Bound (% do CDI)_base", "Upper Bound (% do CDI)_base",
-    ]
-    for c in num_cols:
+    ]:
         res[c] = pd.to_numeric(res[c], errors="coerce")
 
     res["Carteira"] = pd.Categorical(res["Carteira"], categories=carteira_order, ordered=True)
@@ -183,7 +191,6 @@ def prepare_visual_table_consistent(res_base: pd.DataFrame, vis_tipo: str, vis_w
         df["VIS Upper Bound (% a.a.)"] = df["Upper Bound (% a.a.)"]
 
     cdi_mid = pd.to_numeric(df["CDI Midpoint (% a.a.)"], errors="coerce").replace(0, np.nan)
-
     df["VIS Expected Return (% do CDI)"] = (df["VIS Expected Return (% a.a.)"] / cdi_mid) * 100.0
     df["VIS Lower Bound (% do CDI)"] = (df["VIS Lower Bound (% a.a.)"] / cdi_mid) * 100.0
     df["VIS Upper Bound (% do CDI)"] = (df["VIS Upper Bound (% a.a.)"] / cdi_mid) * 100.0
@@ -197,11 +204,7 @@ def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -
         alt.Chart(bar_long)
         .mark_bar()
         .encode(
-            x=alt.X(
-                "cdi_range:N",
-                sort=alt.SortField(field="range_order", order="ascending"),
-                title="Faixa do CDI (% a.a.)",
-            ),
+            x=alt.X("cdi_range:N", sort=alt.SortField(field="range_order", order="ascending"), title="Faixa do CDI (% a.a.)"),
             xOffset=alt.XOffset("portfolio:N", sort=carteira_order),
             y=alt.Y(f"{y_field}:Q", title=y_title),
             color=alt.Color("portfolio:N", scale=color_scale, legend=alt.Legend(title="Carteira")),
@@ -224,49 +227,7 @@ def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -
             text=alt.Text(f"{y_field}:Q", format=".1f"),
         )
     )
-
     return bars + labels
-
-def make_base100_carteiras_com_cdi(df: pd.DataFrame) -> alt.Chart:
-    """
-    Um gráfico de Base100: 3 carteiras + CDI (Base100_CDI).
-    """
-    cols = [f"Base100_{n}" for n in carteira_order] + ["Base100_CDI"]
-    tmp = df[cols].copy()
-    tmp.columns = carteira_order + ["CDI"]
-
-    long_df = tmp.reset_index().melt(
-        id_vars=[tmp.reset_index().columns[0]],
-        var_name="serie",
-        value_name="base100"
-    )
-    date_col = long_df.columns[0]
-    long_df = long_df.rename(columns={date_col: "data"})
-
-    domain = carteira_order + ["CDI"]
-    range_colors = [CARTEIRA_COLOR[c] for c in carteira_order] + [CDI_BASE100_COLOR]
-    scale = alt.Scale(domain=domain, range=range_colors)
-
-    return (
-        alt.Chart(long_df)
-        .mark_line()
-        .encode(
-            x=alt.X("data:T", title="Data"),
-            y=alt.Y("base100:Q", title="Base 100"),
-            color=alt.Color("serie:N", scale=scale, legend=alt.Legend(title="Série")),
-            strokeDash=alt.condition(
-                alt.datum.serie == "CDI",
-                alt.value([6, 4]),
-                alt.value([1, 0])
-            ),
-            tooltip=[
-                alt.Tooltip("data:T", title="Data"),
-                alt.Tooltip("serie:N", title="Série"),
-                alt.Tooltip("base100:Q", title="Base 100", format=".2f"),
-            ],
-        )
-        .properties(height=520, title="Base 100 — Carteiras + CDI")
-    )
 
 def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
     """
@@ -299,11 +260,7 @@ def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
             x=alt.X("data:T", title="Data"),
             y=alt.Y("base100:Q", title="Base 100"),
             color=alt.Color("serie:N", scale=series_color, legend=alt.Legend(title="Série")),
-            strokeDash=alt.condition(
-                alt.datum.serie == "CDI",
-                alt.value([6, 4]),
-                alt.value([1, 0])
-            ),
+            strokeDash=alt.condition(alt.datum.serie == "CDI", alt.value([6, 4]), alt.value([1, 0])),
             tooltip=[
                 alt.Tooltip("data:T", title="Data"),
                 alt.Tooltip("serie:N", title="Série"),
@@ -332,6 +289,61 @@ def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
         .properties(height=520, title="Base 100 (Carteiras + CDI) e Selic anualizada (eixo direito)")
     )
 
+def make_historical_annualized_pct_cdi(df: pd.DataFrame) -> alt.Chart:
+    """
+    Evolução histórica das estratégias ANUALIZADAS em % do CDI:
+      %CDI(t) = (Retorno_aa_% / CDI_aa_%) * 100
+    onde Retorno_aa_% = (FatorAnual - 1)*100 e CDI_aa_% = (CDIAcumuladoAnual - 1)*100
+    """
+    tmp = df[["CDIAcumuladoAnual"] + [f"FatorAnual_{n}" for n in carteira_order]].copy()
+
+    cdi_pct = (tmp["CDIAcumuladoAnual"] - 1.0) * 100.0
+    cdi_pct = pd.to_numeric(cdi_pct, errors="coerce")
+    cdi_pct = cdi_pct.where(cdi_pct.abs() > 1e-9)  # evita div/0
+
+    out = pd.DataFrame(index=tmp.index)
+    for n in carteira_order:
+        port_pct = (tmp[f"FatorAnual_{n}"] - 1.0) * 100.0
+        out[n] = (port_pct / cdi_pct) * 100.0
+
+    long_df = out.reset_index().melt(
+        id_vars=[out.reset_index().columns[0]],
+        var_name="carteira",
+        value_name="pct_cdi"
+    )
+    long_df = long_df.rename(columns={long_df.columns[0]: "data"})
+    long_df["pct_cdi"] = pd.to_numeric(long_df["pct_cdi"], errors="coerce")
+
+    color_scale = alt.Scale(domain=carteira_order, range=[CARTEIRA_COLOR[c] for c in carteira_order])
+
+    return (
+        alt.Chart(long_df.dropna(subset=["pct_cdi"]))
+        .mark_line()
+        .encode(
+            x=alt.X("data:T", title="Data"),
+            y=alt.Y("pct_cdi:Q", title="Retorno anualizado (% do CDI)"),
+            color=alt.Color("carteira:N", scale=color_scale, legend=alt.Legend(title="Carteira")),
+            tooltip=[
+                alt.Tooltip("data:T", title="Data"),
+                alt.Tooltip("carteira:N", title="Carteira"),
+                alt.Tooltip("pct_cdi:Q", title="% do CDI", format=".2f"),
+            ],
+        )
+        .properties(height=420, title="Evolução histórica — Estratégias anualizadas (% do CDI)")
+    )
+
+# ---------- helpers robustos para interpolação ----------
+def _prepare_xy_unique(sub: pd.DataFrame, x_col: str, y_col: str) -> pd.DataFrame:
+    tmp = sub[[x_col, y_col]].copy()
+    tmp[x_col] = pd.to_numeric(tmp[x_col], errors="coerce")
+    tmp[y_col] = pd.to_numeric(tmp[y_col], errors="coerce")
+    tmp = tmp.dropna(subset=[x_col, y_col])
+
+    # remove duplicatas em x -> média do y
+    tmp = tmp.groupby(x_col, as_index=False)[y_col].mean()
+    tmp = tmp.sort_values(x_col).reset_index(drop=True)
+    return tmp
+
 def plot_continuo_plotly_from_bins(
     res_bins: pd.DataFrame,
     carteira: str,
@@ -342,13 +354,32 @@ def plot_continuo_plotly_from_bins(
     title: str,
     yaxis_title: str,
     ic_label: str,
-    cdi_esperado_pct: float | None = None,
+    cdi_esperado_pct: Optional[float] = None,
 ):
     sub = res_bins[res_bins["Carteira"] == carteira].copy()
-    sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col, low_col, high_col])
+    sub = sub.sort_values("_range_order")
 
-    if len(sub) < 2:
-        st.warning(f"{carteira}: poucos pontos para interpolar (precisa de >= 2 bins com dados).")
+    # numérico + dropna
+    for c in [x_col, y_col, low_col, high_col]:
+        sub[c] = pd.to_numeric(sub[c], errors="coerce")
+    sub = sub.dropna(subset=[x_col, y_col, low_col, high_col])
+
+    if sub.empty:
+        st.warning(f"{carteira}: sem pontos válidos após filtros.")
+        return
+
+    # dedup por x (média)
+    sub = sub.groupby(x_col, as_index=False).agg({
+        y_col: "mean",
+        low_col: "mean",
+        high_col: "mean",
+        "CDI Range (% a.a.)": "first",
+        "Observações": "sum",
+        "_range_order": "min"
+    }).sort_values(x_col).reset_index(drop=True)
+
+    if sub[x_col].nunique() < 2:
+        st.warning(f"{carteira}: precisa de >=2 pontos (x únicos) para interpolar.")
         return
 
     x = sub[x_col].to_numpy(dtype=float)
@@ -380,33 +411,47 @@ def plot_continuo_plotly_from_bins(
         x=x_grid, y=y_high_grid,
         mode="lines",
         fill="tonexty",
-        name=f"Banda ({ic_label})",
+        name="Banda (" + ic_label + ")",
         hoverinfo="skip"
     ))
 
+    # Linha contínua (hover correto)
     custom_line = np.stack([y_low_grid, y_high_grid], axis=1)
+    hover_line = (
+        carteira
+        + "<br>CDI midpoint (% a.a.): %{x:.2f}%"
+        + "<br>Média: %{y:.2f}"
+        + "<br>Min (Lower " + ic_label + "): %{customdata[0]:.2f}"
+        + "<br>Max (Upper " + ic_label + "): %{customdata[1]:.2f}"
+        + "<extra></extra>"
+    )
     fig.add_trace(go.Scatter(
         x=x_grid, y=y_grid,
         mode="lines",
         name="Linha (contínua)",
         line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
         customdata=custom_line,
-        hovertemplate=(
-            f"{carteira}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
-            f"Min (Lower {ic_label}): " + "%{customdata[0]:.2f}<br>"
-            f"Max (Upper {ic_label}): " + "%{customdata[1]:.2f}"
-            "<extra></extra>"
-        )
+        hovertemplate=hover_line
     ))
 
+    # Pontos
     custom_pts = np.stack([
         sub["CDI Range (% a.a.)"].astype(str).to_numpy(),
         sub["Observações"].to_numpy(),
         sub[low_col].to_numpy(),
         sub[high_col].to_numpy(),
     ], axis=1)
+
+    hover_pts = (
+        carteira
+        + "<br>CDI Range: %{customdata[0]}"
+        + "<br>Obs: %{customdata[1]}"
+        + "<br>CDI midpoint (% a.a.): %{x:.2f}%"
+        + "<br>Média: %{y:.2f}"
+        + "<br>Min (Lower " + ic_label + "): %{customdata[2]:.2f}"
+        + "<br>Max (Upper " + ic_label + "): %{customdata[3]:.2f}"
+        + "<extra></extra>"
+    )
 
     fig.add_trace(go.Scatter(
         x=sub[x_col],
@@ -415,16 +460,7 @@ def plot_continuo_plotly_from_bins(
         name="Pontos (bins)",
         marker=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), size=7),
         customdata=custom_pts,
-        hovertemplate=(
-            f"{carteira}<br>"
-            "CDI Range: %{customdata[0]}<br>"
-            "Obs: %{customdata[1]}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
-            f"Min (Lower {ic_label}): " + "%{customdata[2]:.2f}<br>"
-            f"Max (Upper {ic_label}): " + "%{customdata[3]:.2f}"
-            "<extra></extra>"
-        )
+        hovertemplate=hover_pts
     ))
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
@@ -446,31 +482,54 @@ def plot_continuo_plotly_from_bins(
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, title: str, yaxis_title: str, cdi_esperado_pct: float | None = None):
+def plot_all_three_lines_no_ic(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: Optional[float] = None
+):
     fig = go.Figure()
+    any_trace = False
 
     for carteira in carteira_order:
-        sub = res_bins[res_bins["Carteira"] == carteira].copy()
-        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
-        if len(sub) < 2:
+        sub = res_bins[res_bins["Carteira"] == carteira].copy().sort_values("_range_order")
+        tmp = _prepare_xy_unique(sub, x_col, y_col)
+        if tmp.shape[0] < 2:
             continue
 
-        x = sub[x_col].to_numpy(dtype=float)
-        y = sub[y_col].to_numpy(dtype=float)
+        x = tmp[x_col].to_numpy(dtype=float)
+        y = tmp[y_col].to_numpy(dtype=float)
+        x_grid = np.linspace(float(x.min()), float(x.max()), 300)
 
-        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
-        y_grid = PchipInterpolator(x, y)(x_grid)
+        try:
+            y_grid = PchipInterpolator(x, y)(x_grid)
+        except Exception as e:
+            st.warning(f"Falha ao interpolar {carteira}: {e}")
+            continue
+
+        hovertemplate = (
+            carteira
+            + "<br>CDI midpoint: %{x:.2f}%"
+            + "<br>Retorno: %{y:.2f}"
+            + "<extra></extra>"
+        )
 
         fig.add_trace(go.Scatter(
             x=x_grid, y=y_grid,
             mode="lines",
             name=carteira,
             line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
-            hovertemplate=(f"{carteira}<br>CDI midpoint: %{x:.2f}%<br>Retorno: %{y:.2f}<extra></extra>")
+            hovertemplate=hovertemplate
         ))
+        any_trace = True
+
+    if not any_trace:
+        st.warning("Sem pontos suficientes para montar o comparativo (precisa de >=2 bins válidos por carteira).")
+        return
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
         fig.add_vline(
@@ -491,31 +550,53 @@ def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, t
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_col: str, title: str, yaxis_title: str, cdi_esperado_pct: float | None = None):
+def plot_all_three_lines_linear_endpoints(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: Optional[float] = None
+):
     fig = go.Figure()
+    any_trace = False
 
     for carteira in carteira_order:
-        sub = res_bins[res_bins["Carteira"] == carteira].copy()
-        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
-        if len(sub) < 2:
+        sub = res_bins[res_bins["Carteira"] == carteira].copy().sort_values("_range_order")
+        tmp = _prepare_xy_unique(sub, x_col, y_col)
+        if tmp.shape[0] < 2:
             continue
 
-        x0 = float(sub[x_col].iloc[0]); y0 = float(sub[y_col].iloc[0])
-        x1 = float(sub[x_col].iloc[-1]); y1 = float(sub[y_col].iloc[-1])
+        x0 = float(tmp[x_col].iloc[0]); y0 = float(tmp[y_col].iloc[0])
+        x1 = float(tmp[x_col].iloc[-1]); y1 = float(tmp[y_col].iloc[-1])
+
+        if x1 == x0:
+            continue
 
         x_grid = np.linspace(x0, x1, 300)
         y_grid = y0 + (y1 - y0) * (x_grid - x0) / (x1 - x0)
+
+        hovertemplate = (
+            carteira + " (reta)"
+            + "<br>CDI midpoint: %{x:.2f}%"
+            + "<br>Retorno: %{y:.2f}"
+            + "<extra></extra>"
+        )
 
         fig.add_trace(go.Scatter(
             x=x_grid, y=y_grid,
             mode="lines",
             name=f"{carteira} (reta)",
             line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
-            hovertemplate=(f"{carteira}<br>CDI midpoint: %{x:.2f}%<br>Retorno: %{y:.2f}<extra></extra>")
+            hovertemplate=hovertemplate
         ))
+        any_trace = True
+
+    if not any_trace:
+        st.warning("Sem pontos suficientes para montar o comparativo (reta).")
+        return
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
         fig.add_vline(
@@ -536,7 +617,6 @@ def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_
         margin=dict(l=20, r=20, t=60, b=30),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
@@ -562,7 +642,7 @@ if missing:
     st.stop()
 
 # =========================
-# COMPUTE (FULL) — primeiro calcula em tudo
+# COMPUTE FULL
 # =========================
 df_full = compute_everything(df_raw, window=WINDOW_ANUAL)
 
@@ -571,7 +651,7 @@ df_full = compute_everything(df_raw, window=WINDOW_ANUAL)
 # =========================
 st.sidebar.header("Parâmetros")
 
-# ✅ NOVO: data inicial
+# ✅ data inicial
 min_date = df_full.index.min().date()
 max_date = df_full.index.max().date()
 
@@ -617,11 +697,11 @@ st.sidebar.subheader("Visualização: métrica")
 vis_metric = st.sidebar.selectbox("Ver retornos como…", ["% do CDI", "Retorno Esperado (% a.a.)"], index=0)
 
 # =========================
-# APLICA CORTE POR DATA (em tudo que será usado na análise/plots)
+# APLICA CORTE POR DATA
 # =========================
 df = df_full[df_full.index >= start_ts].copy()
 
-# aplica filtro de tendência (para tabela/bins/barras)
+# filtro de tendência (somente para tabela/bins/barras)
 df_regime = df.copy()
 if trend_choice in ["Subindo", "Caindo"]:
     df_regime = df_regime[df_regime["SelicTrend"] == trend_choice]
@@ -633,8 +713,12 @@ st.divider()
 st.subheader("Evolução histórica — Carteiras (Base 100) + CDI (Base 100) e Selic anualizada")
 st.altair_chart(make_dual_axis_selic_base100_with_cdi(df), use_container_width=True)
 
-# (opcional) um gráfico só Base100 (carteiras + CDI), sem Selic:
-# st.altair_chart(make_base100_carteiras_com_cdi(df), use_container_width=True)
+# =========================
+# ✅ NOVO: HISTÓRICO — ANUALIZADO EM % DO CDI
+# =========================
+st.divider()
+st.subheader("Evolução histórica — Estratégias anualizadas em % do CDI (rolling 252)")
+st.altair_chart(make_historical_annualized_pct_cdi(df), use_container_width=True)
 
 # =========================
 # 1) TABELA + BARRAS
@@ -647,7 +731,7 @@ if results_df_base.empty:
     st.warning("Não houve observações suficientes nas faixas escolhidas (ou faltam dados na janela anual).")
     st.stop()
 
-# tabela VIS consistente (base vs suavizado de verdade)
+# visão VIS consistente
 res_vis = prepare_visual_table_consistent(results_df_base, vis_tipo=vis_tipo, vis_w=vis_w)
 label_suffix = " | Base" if vis_tipo == "Base" else f" | Suavizado (w={vis_w})"
 
@@ -659,7 +743,7 @@ range_order = (
     .tolist()
 )
 
-# tabela “bonita”
+# tabela (arredonda só pra exibir)
 table_cols = [
     "CDI Range (% a.a.)",
     "Carteira",
@@ -673,8 +757,6 @@ table_cols = [
     "Observações",
 ]
 results_df_table = res_vis[table_cols].copy()
-
-# arredonda só pra exibição
 for c in table_cols:
     if c not in ["CDI Range (% a.a.)", "Carteira"]:
         results_df_table[c] = pd.to_numeric(results_df_table[c], errors="coerce").round(2)
@@ -682,10 +764,9 @@ for c in table_cols:
 results_df_table["Carteira"] = pd.Categorical(results_df_table["Carteira"], categories=carteira_order, ordered=True)
 results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Range (% a.a.)"], categories=range_order, ordered=True)
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
-
 st.dataframe(results_df_table, use_container_width=True)
 
-# escolhe colunas para barras + contínuo (sempre VIS)
+# seleciona métrica VIS
 if vis_metric == "% do CDI":
     y_col = "VIS Expected Return (% do CDI)"
     low_col = "VIS Lower Bound (% do CDI)"
@@ -699,7 +780,7 @@ else:
     y_title = "Expected Return (% a.a.)"
     final_title = "Retorno esperado (% a.a.)"
 
-# barras
+# barras (também afetadas por Base vs Suavizado)
 bar_base = res_vis[["CDI Range (% a.a.)", "_range_order", "Carteira", y_col]].copy()
 bar_base = bar_base.rename(columns={
     "CDI Range (% a.a.)": "cdi_range",
@@ -743,7 +824,6 @@ for carteira in carteira_order:
 # =========================
 st.divider()
 st.subheader("Comparativo — 3 carteiras na mesma curva (sem IC)")
-
 plot_all_three_lines_no_ic(
     res_bins=res_vis,
     x_col="CDI Midpoint (% a.a.)",
@@ -754,11 +834,10 @@ plot_all_three_lines_no_ic(
 )
 
 # =========================
-# 4) COMPARATIVO (reta entre extremos, sem IC)
+# 4) COMPARATIVO (reta extremos, sem IC)
 # =========================
 st.divider()
 st.subheader("Comparativo — reta linear ligando o extremo esquerdo ao extremo direito (sem IC)")
-
 plot_all_three_lines_linear_endpoints(
     res_bins=res_vis,
     x_col="CDI Midpoint (% a.a.)",
