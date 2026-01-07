@@ -256,126 +256,6 @@ def make_dual_axis_selic_base100(df: pd.DataFrame) -> alt.Chart:
         .properties(height=520, title="Selic anualizada (eixo direito) vs Base 100 das carteiras (eixo esquerdo)")
     )
 
-def plot_continuo_plotly_from_bins(
-    res_bins: pd.DataFrame,
-    carteira: str,
-    x_col: str,
-    y_col: str,
-    low_col: str,
-    high_col: str,
-    title: str,
-    yaxis_title: str,
-    ic_label: str,
-    cdi_esperado_pct: float | None = None,
-):
-    sub = res_bins[res_bins["Carteira"] == carteira].copy()
-    sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col, low_col, high_col])
-
-    if len(sub) < 2:
-        st.warning(f"{carteira}: poucos pontos para interpolar (precisa de >= 2 bins com dados).")
-        return
-
-    x = sub[x_col].to_numpy(dtype=float)
-    y = sub[y_col].to_numpy(dtype=float)
-    y_low = sub[low_col].to_numpy(dtype=float)
-    y_high = sub[high_col].to_numpy(dtype=float)
-
-    x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
-
-    mean_spline = PchipInterpolator(x, y)
-    low_spline = PchipInterpolator(x, y_low)
-    high_spline = PchipInterpolator(x, y_high)
-
-    y_grid = mean_spline(x_grid)
-    y_low_grid = low_spline(x_grid)
-    y_high_grid = high_spline(x_grid)
-
-    fig = go.Figure()
-
-    # Banda sem hover
-    fig.add_trace(go.Scatter(
-        x=x_grid, y=y_low_grid,
-        mode="lines",
-        line=dict(width=0),
-        hoverinfo="skip",
-        showlegend=False
-    ))
-    fig.add_trace(go.Scatter(
-        x=x_grid, y=y_high_grid,
-        mode="lines",
-        fill="tonexty",
-        name=f"Banda ({ic_label})",
-        hoverinfo="skip"
-    ))
-
-    # Linha com hover completo
-    custom_line = np.stack([y_low_grid, y_high_grid], axis=1)
-    fig.add_trace(go.Scatter(
-        x=x_grid, y=y_grid,
-        mode="lines",
-        name="Linha (contínua)",
-        line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
-        customdata=custom_line,
-        hovertemplate=(
-            f"{carteira}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
-            f"Min (Lower {ic_label}): " + "%{customdata[0]:.2f}<br>"
-            f"Max (Upper {ic_label}): " + "%{customdata[1]:.2f}"
-            "<extra></extra>"
-        )
-    ))
-
-    # Pontos (bins)
-    custom_pts = np.stack([
-        sub["CDI Range (% a.a.)"].astype(str).to_numpy(),
-        sub["Observações"].to_numpy(),
-        sub[low_col].to_numpy(),
-        sub[high_col].to_numpy(),
-    ], axis=1)
-
-    fig.add_trace(go.Scatter(
-        x=sub[x_col],
-        y=sub[y_col],
-        mode="markers",
-        name="Pontos (bins)",
-        marker=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), size=7),
-        customdata=custom_pts,
-        hovertemplate=(
-            f"{carteira}<br>"
-            "CDI Range: %{customdata[0]}<br>"
-            "Obs: %{customdata[1]}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
-            f"Min (Lower {ic_label}): " + "%{customdata[2]:.2f}<br>"
-            f"Max (Upper {ic_label}): " + "%{customdata[3]:.2f}"
-            "<extra></extra>"
-        )
-    ))
-
-    # Linha vertical: CDI esperado + label
-    if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
-        fig.add_vline(
-            x=float(cdi_esperado_pct),
-            line_width=2,
-            line_dash="dash",
-            line_color="#444444",
-            annotation_text=f"CDI esp.: {cdi_esperado_pct:.2f}%",
-            annotation_position="top left"
-        )
-
-    fig.update_layout(
-        title=title,
-        xaxis_title="CDI midpoint (% a.a.)",
-        yaxis_title=yaxis_title,
-        hovermode="x unified",
-        height=420,
-        margin=dict(l=20, r=20, t=60, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
 def plot_all_three_lines_no_ic(
     res_bins: pd.DataFrame,
     x_col: str,
@@ -385,15 +265,14 @@ def plot_all_three_lines_no_ic(
     cdi_esperado_pct: float | None = None,
 ):
     """
-    Gráfico final: 3 linhas juntas (Conservador/Moderado/Agressivo), sem banda/IC.
-    Inclui a linha vertical do CDI esperado.
+    Gráfico final: 3 linhas juntas, sem banda/IC.
+    Usa PCHIP para ligar os pontos de cada carteira.
     """
     fig = go.Figure()
 
     for carteira in carteira_order:
         sub = res_bins[res_bins["Carteira"] == carteira].copy()
         sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
-
         if len(sub) < 2:
             continue
 
@@ -417,7 +296,6 @@ def plot_all_three_lines_no_ic(
             )
         ))
 
-        # opcional: marcar os pontos dos bins
         fig.add_trace(go.Scatter(
             x=x,
             y=y,
@@ -427,6 +305,88 @@ def plot_all_three_lines_no_ic(
             showlegend=False,
             hovertemplate=(
                 f"{carteira} (bin)<br>"
+                "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+                "Retorno: %{y:.2f}"
+                "<extra></extra>"
+            )
+        ))
+
+    if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
+        fig.add_vline(
+            x=float(cdi_esperado_pct),
+            line_width=2,
+            line_dash="dash",
+            line_color="#444444",
+            annotation_text=f"CDI esp.: {cdi_esperado_pct:.2f}%",
+            annotation_position="top left"
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="CDI midpoint (% a.a.)",
+        yaxis_title=yaxis_title,
+        hovermode="x unified",
+        height=520,
+        margin=dict(l=20, r=20, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+def plot_all_three_lines_linear_endpoints(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: float | None = None,
+):
+    """
+    NOVO gráfico: 3 linhas juntas, SEM IC, mas cada carteira é uma RETA
+    ligando apenas o ponto mais à esquerda ao ponto mais à direita (linear endpoint-to-endpoint).
+    """
+    fig = go.Figure()
+
+    for carteira in carteira_order:
+        sub = res_bins[res_bins["Carteira"] == carteira].copy()
+        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
+        if len(sub) < 2:
+            continue
+
+        # extremos
+        x0 = float(sub[x_col].iloc[0])
+        y0 = float(sub[y_col].iloc[0])
+        x1 = float(sub[x_col].iloc[-1])
+        y1 = float(sub[y_col].iloc[-1])
+
+        # linha contínua (reta)
+        x_grid = np.linspace(x0, x1, 300)
+        y_grid = y0 + (y1 - y0) * (x_grid - x0) / (x1 - x0)
+
+        fig.add_trace(go.Scatter(
+            x=x_grid,
+            y=y_grid,
+            mode="lines",
+            name=f"{carteira} (reta)",
+            line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
+            hovertemplate=(
+                f"{carteira} (reta)<br>"
+                "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+                "Retorno: %{y:.2f}"
+                "<extra></extra>"
+            )
+        ))
+
+        # marca só os extremos (pra ficar fiel ao que você descreveu)
+        fig.add_trace(go.Scatter(
+            x=[x0, x1],
+            y=[y0, y1],
+            mode="markers",
+            name=f"{carteira} (extremos)",
+            marker=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), size=8),
+            showlegend=False,
+            hovertemplate=(
+                f"{carteira} (extremo)<br>"
                 "CDI midpoint (% a.a.): %{x:.2f}%<br>"
                 "Retorno: %{y:.2f}"
                 "<extra></extra>"
@@ -548,7 +508,6 @@ st.divider()
 st.subheader(f"Tabela — Retorno esperado por faixa de CDI anual (Selic: {trend_choice})")
 
 results_df = build_cdi_regime_table(df_regime, bins=bins, z=z)
-
 if results_df.empty:
     st.warning("Não houve observações suficientes nas faixas escolhidas.")
     st.stop()
@@ -566,39 +525,34 @@ results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Ra
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
 st.dataframe(results_df_table, use_container_width=True)
 
+# aplica suavização (se escolhido)
 res_vis = results_df.copy()
 label_suffix = " | Base"
 if vis_tipo == "Suavizado":
     res_vis = add_smoothing_to_bins_table(res_vis, window_size=vis_w)
     label_suffix = f" | Suavizado (w={vis_w})"
 
+# escolhe colunas para (barras e gráficos finais)
 if vis_metric == "% do CDI":
     if vis_tipo == "Base":
         y_col = "Expected Return (% do CDI)"
-        low_col = "Lower Bound (% do CDI)"
-        high_col = "Upper Bound (% do CDI)"
         y_title = "Expected Return (% do CDI)"
         final_title = "Retorno (% do CDI)"
     else:
         y_col = f"Smoothed Expected Return (% do CDI) (w={vis_w})"
-        low_col = f"Smoothed Lower Bound (% do CDI) (w={vis_w})"
-        high_col = f"Smoothed Upper Bound (% do CDI) (w={vis_w})"
         y_title = "Expected Return (% do CDI) — suavizado"
         final_title = "Retorno (% do CDI) — suavizado"
 else:
     if vis_tipo == "Base":
         y_col = "Expected Return (% a.a.)"
-        low_col = "Lower Bound (% a.a.)"
-        high_col = "Upper Bound (% a.a.)"
         y_title = "Expected Return (% a.a.)"
         final_title = "Retorno esperado (% a.a.)"
     else:
         y_col = f"Smoothed Expected Return (% a.a.) (w={vis_w})"
-        low_col = f"Smoothed Lower Bound (% a.a.) (w={vis_w})"
-        high_col = f"Smoothed Upper Bound (% a.a.) (w={vis_w})"
         y_title = "Expected Return (% a.a.) — suavizado"
         final_title = "Retorno esperado (% a.a.) — suavizado"
 
+# barras
 bar_base = res_vis[["CDI Range (% a.a.)", "_range_order", "Carteira", y_col]].copy()
 bar_base = bar_base.rename(columns={
     "CDI Range (% a.a.)": "cdi_range",
@@ -621,27 +575,7 @@ else:
     )
 
 # =========================
-# 2) VIEW CONTÍNUA (empilhada)
-# =========================
-st.divider()
-st.subheader("View contínua (interativa) — Retorno vs CDI (a partir dos bins)")
-
-for carteira in carteira_order:
-    plot_continuo_plotly_from_bins(
-        res_bins=res_vis,
-        carteira=carteira,
-        x_col="CDI Midpoint (% a.a.)",
-        y_col=y_col,
-        low_col=low_col,
-        high_col=high_col,
-        title=f"{carteira} — {vis_metric}{label_suffix} (IC {ic_level_label})",
-        yaxis_title=y_title,
-        ic_label=ic_level_label,
-        cdi_esperado_pct=float(cdi_esperado_pct),
-    )
-
-# =========================
-# 3) GRÁFICO FINAL: 3 LINHAS JUNTAS (sem IC)
+# 2) GRÁFICO FINAL: 3 LINHAS JUNTAS (PCHIP, sem IC)
 # =========================
 st.divider()
 st.subheader("Comparativo — 3 carteiras na mesma curva (sem IC)")
@@ -651,6 +585,21 @@ plot_all_three_lines_no_ic(
     x_col="CDI Midpoint (% a.a.)",
     y_col=y_col,
     title=f"Conservador vs Moderado vs Agressivo — {final_title}{label_suffix}",
+    yaxis_title=y_title,
+    cdi_esperado_pct=float(cdi_esperado_pct),
+)
+
+# =========================
+# 3) NOVO GRÁFICO: 3 LINHAS (RETA entre extremos, sem IC)
+# =========================
+st.divider()
+st.subheader("Comparativo — reta linear ligando o extremo esquerdo ao extremo direito (sem IC)")
+
+plot_all_three_lines_linear_endpoints(
+    res_bins=res_vis,
+    x_col="CDI Midpoint (% a.a.)",
+    y_col=y_col,
+    title=f"Conservador vs Moderado vs Agressivo — reta entre extremos — {final_title}{label_suffix}",
     yaxis_title=y_title,
     cdi_esperado_pct=float(cdi_esperado_pct),
 )
