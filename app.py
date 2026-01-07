@@ -69,7 +69,7 @@ def compute_everything(df_raw: pd.DataFrame, window: int) -> pd.DataFrame:
     # numéricos nas classes
     df[assets] = df[assets].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
-    # Selic anualizada
+    # Selic anualizada a partir do CDI diário
     df["SelicAnualizada"] = (1.0 + df["CDI"]).pow(window) - 1.0
     df["SelicTrend"] = np.where(df["SelicAnualizada"].diff() >= 0, "Subindo", "Caindo")
 
@@ -116,7 +116,7 @@ def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.D
             lower_pct = (lower_factor - 1.0) * 100.0
             upper_pct = (upper_factor - 1.0) * 100.0
 
-            # %CDI base apenas informativo (a VISÃO vai derivar de forma consistente)
+            # %CDI base (apenas informativo; visão usa derivação consistente)
             if cdi_mid_pct != 0:
                 exp_pct_cdi = (exp_pct / cdi_mid_pct) * 100.0
                 lower_pct_cdi = (lower_pct / cdi_mid_pct) * 100.0
@@ -226,47 +226,6 @@ def make_grouped_bar_chart(bar_long: pd.DataFrame, y_field: str, y_title: str) -
     )
 
     return bars + labels
-
-def make_base100_carteiras_com_cdi(df: pd.DataFrame) -> alt.Chart:
-    """
-    Um gráfico de Base100: 3 carteiras + CDI (Base100_CDI).
-    """
-    cols = [f"Base100_{n}" for n in carteira_order] + ["Base100_CDI"]
-    tmp = df[cols].copy()
-    tmp.columns = carteira_order + ["CDI"]
-
-    long_df = tmp.reset_index().melt(
-        id_vars=[tmp.reset_index().columns[0]],
-        var_name="serie",
-        value_name="base100"
-    )
-    date_col = long_df.columns[0]
-    long_df = long_df.rename(columns={date_col: "data"})
-
-    domain = carteira_order + ["CDI"]
-    range_colors = [CARTEIRA_COLOR[c] for c in carteira_order] + [CDI_BASE100_COLOR]
-    scale = alt.Scale(domain=domain, range=range_colors)
-
-    return (
-        alt.Chart(long_df)
-        .mark_line()
-        .encode(
-            x=alt.X("data:T", title="Data"),
-            y=alt.Y("base100:Q", title="Base 100"),
-            color=alt.Color("serie:N", scale=scale, legend=alt.Legend(title="Série")),
-            strokeDash=alt.condition(
-                alt.datum.serie == "CDI",
-                alt.value([6, 4]),
-                alt.value([1, 0])
-            ),
-            tooltip=[
-                alt.Tooltip("data:T", title="Data"),
-                alt.Tooltip("serie:N", title="Série"),
-                alt.Tooltip("base100:Q", title="Base 100", format=".2f"),
-            ],
-        )
-        .properties(height=520, title="Base 100 — Carteiras + CDI")
-    )
 
 def make_dual_axis_selic_base100_with_cdi(df: pd.DataFrame) -> alt.Chart:
     """
@@ -393,8 +352,8 @@ def plot_continuo_plotly_from_bins(
         customdata=custom_line,
         hovertemplate=(
             f"{carteira}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
+            "CDI midpoint (% a.a.): %{{x:.2f}}%<br>"
+            "Média: %{{y:.2f}}<br>"
             f"Min (Lower {ic_label}): " + "%{customdata[0]:.2f}<br>"
             f"Max (Upper {ic_label}): " + "%{customdata[1]:.2f}"
             "<extra></extra>"
@@ -419,8 +378,8 @@ def plot_continuo_plotly_from_bins(
             f"{carteira}<br>"
             "CDI Range: %{customdata[0]}<br>"
             "Obs: %{customdata[1]}<br>"
-            "CDI midpoint (% a.a.): %{x:.2f}%<br>"
-            "Média: %{y:.2f}<br>"
+            "CDI midpoint (% a.a.): %{{x:.2f}}%<br>"
+            "Média: %{{y:.2f}}<br>"
             f"Min (Lower {ic_label}): " + "%{customdata[2]:.2f}<br>"
             f"Max (Upper {ic_label}): " + "%{customdata[3]:.2f}"
             "<extra></extra>"
@@ -469,7 +428,12 @@ def plot_all_three_lines_no_ic(res_bins: pd.DataFrame, x_col: str, y_col: str, t
             mode="lines",
             name=carteira,
             line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
-            hovertemplate=(f"{carteira}<br>CDI midpoint: %{x:.2f}%<br>Retorno: %{y:.2f}<extra></extra>")
+            hovertemplate=(
+                f"{carteira}<br>"
+                "CDI midpoint: %{{x:.2f}}%<br>"
+                "Retorno: %{{y:.2f}}"
+                "<extra></extra>"
+            )
         ))
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
@@ -514,7 +478,12 @@ def plot_all_three_lines_linear_endpoints(res_bins: pd.DataFrame, x_col: str, y_
             mode="lines",
             name=f"{carteira} (reta)",
             line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
-            hovertemplate=(f"{carteira}<br>CDI midpoint: %{x:.2f}%<br>Retorno: %{y:.2f}<extra></extra>")
+            hovertemplate=(
+                f"{carteira} (reta)<br>"
+                "CDI midpoint: %{{x:.2f}}%<br>"
+                "Retorno: %{{y:.2f}}"
+                "<extra></extra>"
+            )
         ))
 
     if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
@@ -562,7 +531,7 @@ if missing:
     st.stop()
 
 # =========================
-# COMPUTE (FULL) — primeiro calcula em tudo
+# COMPUTE FULL
 # =========================
 df_full = compute_everything(df_raw, window=WINDOW_ANUAL)
 
@@ -617,11 +586,11 @@ st.sidebar.subheader("Visualização: métrica")
 vis_metric = st.sidebar.selectbox("Ver retornos como…", ["% do CDI", "Retorno Esperado (% a.a.)"], index=0)
 
 # =========================
-# APLICA CORTE POR DATA (em tudo que será usado na análise/plots)
+# APLICA CORTE POR DATA
 # =========================
 df = df_full[df_full.index >= start_ts].copy()
 
-# aplica filtro de tendência (para tabela/bins/barras)
+# filtro de tendência
 df_regime = df.copy()
 if trend_choice in ["Subindo", "Caindo"]:
     df_regime = df_regime[df_regime["SelicTrend"] == trend_choice]
@@ -632,9 +601,6 @@ if trend_choice in ["Subindo", "Caindo"]:
 st.divider()
 st.subheader("Evolução histórica — Carteiras (Base 100) + CDI (Base 100) e Selic anualizada")
 st.altair_chart(make_dual_axis_selic_base100_with_cdi(df), use_container_width=True)
-
-# (opcional) um gráfico só Base100 (carteiras + CDI), sem Selic:
-# st.altair_chart(make_base100_carteiras_com_cdi(df), use_container_width=True)
 
 # =========================
 # 1) TABELA + BARRAS
@@ -647,7 +613,7 @@ if results_df_base.empty:
     st.warning("Não houve observações suficientes nas faixas escolhidas (ou faltam dados na janela anual).")
     st.stop()
 
-# tabela VIS consistente (base vs suavizado de verdade)
+# visão VIS consistente
 res_vis = prepare_visual_table_consistent(results_df_base, vis_tipo=vis_tipo, vis_w=vis_w)
 label_suffix = " | Base" if vis_tipo == "Base" else f" | Suavizado (w={vis_w})"
 
@@ -659,7 +625,7 @@ range_order = (
     .tolist()
 )
 
-# tabela “bonita”
+# tabela (arredonda só pra exibir)
 table_cols = [
     "CDI Range (% a.a.)",
     "Carteira",
@@ -673,8 +639,6 @@ table_cols = [
     "Observações",
 ]
 results_df_table = res_vis[table_cols].copy()
-
-# arredonda só pra exibição
 for c in table_cols:
     if c not in ["CDI Range (% a.a.)", "Carteira"]:
         results_df_table[c] = pd.to_numeric(results_df_table[c], errors="coerce").round(2)
@@ -682,10 +646,9 @@ for c in table_cols:
 results_df_table["Carteira"] = pd.Categorical(results_df_table["Carteira"], categories=carteira_order, ordered=True)
 results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Range (% a.a.)"], categories=range_order, ordered=True)
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
-
 st.dataframe(results_df_table, use_container_width=True)
 
-# escolhe colunas para barras + contínuo (sempre VIS)
+# seleciona métrica VIS
 if vis_metric == "% do CDI":
     y_col = "VIS Expected Return (% do CDI)"
     low_col = "VIS Lower Bound (% do CDI)"
@@ -754,7 +717,7 @@ plot_all_three_lines_no_ic(
 )
 
 # =========================
-# 4) COMPARATIVO (reta entre extremos, sem IC)
+# 4) COMPARATIVO (reta extremos, sem IC)
 # =========================
 st.divider()
 st.subheader("Comparativo — reta linear ligando o extremo esquerdo ao extremo direito (sem IC)")
@@ -771,3 +734,4 @@ plot_all_three_lines_linear_endpoints(
 with st.expander("Diagnóstico (regime filtrado): colunas anuais usadas"):
     cols_diag = ["CDIAcumuladoAnual", "SelicAnualizada", "SelicTrend"] + [f"FatorAnual_{n}" for n in carteira_order]
     st.dataframe(df_regime[cols_diag].dropna().head(50), use_container_width=True)
+
