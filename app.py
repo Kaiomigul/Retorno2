@@ -16,7 +16,7 @@ SELIC_COLOR = "#c00000"
 
 CARTEIRA_COLOR = {
     "Conservador": "#08082a",
-    "Moderado": "#c00000",     # vermelho (como você pediu)
+    "Moderado": "#c00000",     # vermelho
     "Agressivo": "#dfac16",
 }
 
@@ -47,7 +47,6 @@ def rolling_annual_factor(series: pd.Series, window: int) -> pd.Series:
     return np.exp(np.log1p(s).rolling(window=window).sum())
 
 def calculate_metrics(factor_series: pd.Series, z: float):
-    """Média e IC (média ± z*std) no espaço de FATOR (ex: 1.10)."""
     s = pd.to_numeric(factor_series, errors="coerce").dropna()
     if s.empty:
         return None
@@ -81,10 +80,6 @@ def compute_everything(df_raw: pd.DataFrame, window: int) -> pd.DataFrame:
     return df
 
 def build_cdi_regime_table(df: pd.DataFrame, bins: np.ndarray, z: float) -> pd.DataFrame:
-    """
-    Monta tabela por bins.
-    Importante: nomes das colunas de IC ficam genéricos (sem '90%') para permitir trocar o nível.
-    """
     results = []
 
     for i in range(len(bins) - 1):
@@ -381,6 +376,85 @@ def plot_continuo_plotly_from_bins(
 
     st.plotly_chart(fig, use_container_width=True)
 
+def plot_all_three_lines_no_ic(
+    res_bins: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    yaxis_title: str,
+    cdi_esperado_pct: float | None = None,
+):
+    """
+    Gráfico final: 3 linhas juntas (Conservador/Moderado/Agressivo), sem banda/IC.
+    Inclui a linha vertical do CDI esperado.
+    """
+    fig = go.Figure()
+
+    for carteira in carteira_order:
+        sub = res_bins[res_bins["Carteira"] == carteira].copy()
+        sub = sub.sort_values("_range_order").dropna(subset=[x_col, y_col])
+
+        if len(sub) < 2:
+            continue
+
+        x = sub[x_col].to_numpy(dtype=float)
+        y = sub[y_col].to_numpy(dtype=float)
+
+        x_grid = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 300)
+        y_grid = PchipInterpolator(x, y)(x_grid)
+
+        fig.add_trace(go.Scatter(
+            x=x_grid,
+            y=y_grid,
+            mode="lines",
+            name=carteira,
+            line=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), width=2),
+            hovertemplate=(
+                f"{carteira}<br>"
+                "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+                "Retorno: %{y:.2f}"
+                "<extra></extra>"
+            )
+        ))
+
+        # opcional: marcar os pontos dos bins
+        fig.add_trace(go.Scatter(
+            x=x,
+            y=y,
+            mode="markers",
+            name=f"{carteira} (bins)",
+            marker=dict(color=CARTEIRA_COLOR.get(carteira, "#333333"), size=6),
+            showlegend=False,
+            hovertemplate=(
+                f"{carteira} (bin)<br>"
+                "CDI midpoint (% a.a.): %{x:.2f}%<br>"
+                "Retorno: %{y:.2f}"
+                "<extra></extra>"
+            )
+        ))
+
+    if cdi_esperado_pct is not None and np.isfinite(cdi_esperado_pct):
+        fig.add_vline(
+            x=float(cdi_esperado_pct),
+            line_width=2,
+            line_dash="dash",
+            line_color="#444444",
+            annotation_text=f"CDI esp.: {cdi_esperado_pct:.2f}%",
+            annotation_position="top left"
+        )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="CDI midpoint (% a.a.)",
+        yaxis_title=yaxis_title,
+        hovermode="x unified",
+        height=520,
+        margin=dict(l=20, r=20, t=60, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 # =========================
 # LOAD
 # =========================
@@ -408,7 +482,6 @@ if missing:
 # =========================
 st.sidebar.header("Parâmetros")
 
-# IC controlado por nível (mais fácil/limpo)
 st.sidebar.subheader("Intervalo de confiança (banda)")
 ic_level_label = st.sidebar.selectbox("Nível do IC", ["68%", "90%", "95%"], index=1)
 ic_level = float(ic_level_label.replace("%", "")) / 100.0
@@ -418,8 +491,6 @@ st.sidebar.caption(f"Z usado: {z:.3f}")
 st.sidebar.subheader("Faixas do CDI anual (em %)")
 bin_start_pct = st.sidebar.number_input("Início (%)", value=2.0, step=0.5, format="%.1f")
 bin_end_pct   = st.sidebar.number_input("Fim (%)", value=16.0, step=0.5, format="%.1f")
-
-# ✅ aqui é o ajuste: passo de 0,5 em 0,5
 bin_step_pct  = st.sidebar.number_input("Passo (%)", value=2.0, step=0.5, format="%.1f", min_value=0.5)
 
 if bin_end_pct <= bin_start_pct + bin_step_pct:
@@ -431,17 +502,15 @@ bins = np.arange(1 + bin_start_pct/100.0, 1 + bin_end_pct/100.0 + 1e-9, bin_step
 st.sidebar.subheader("Regime de Selic (tendência)")
 trend_choice = st.sidebar.selectbox("Filtrar períodos por Selic", ["Todos", "Subindo", "Caindo"], index=0)
 
-# ✅ CDI esperado para marcar no gráfico contínuo
 st.sidebar.subheader("CDI esperado (para marcar no gráfico)")
 cdi_esperado_pct = st.sidebar.number_input(
     "CDI esperado (% a.a.)",
     value=10.0,
     step=0.1,
     format="%.2f",
-    help="Digite o CDI esperado em % ao ano (ex.: 10.50). Será desenhada uma linha vertical na view contínua."
+    help="Digite o CDI esperado em % ao ano (ex.: 10.50). Será desenhada uma linha vertical nos gráficos contínuos."
 )
 
-# Opções unificadas (barras + contínuo)
 st.sidebar.subheader("Visualização: retorno base vs suavizado")
 vis_tipo = st.sidebar.radio("Tipo de retorno", ["Base", "Suavizado"], index=1, horizontal=True)
 
@@ -497,38 +566,39 @@ results_df_table["CDI Range (% a.a.)"] = pd.Categorical(results_df_table["CDI Ra
 results_df_table = results_df_table.sort_values(["CDI Range (% a.a.)", "Carteira"])
 st.dataframe(results_df_table, use_container_width=True)
 
-# aplica suavização (se escolhido)
 res_vis = results_df.copy()
 label_suffix = " | Base"
 if vis_tipo == "Suavizado":
     res_vis = add_smoothing_to_bins_table(res_vis, window_size=vis_w)
     label_suffix = f" | Suavizado (w={vis_w})"
 
-# escolhe colunas para barras + contínuo
 if vis_metric == "% do CDI":
     if vis_tipo == "Base":
         y_col = "Expected Return (% do CDI)"
         low_col = "Lower Bound (% do CDI)"
         high_col = "Upper Bound (% do CDI)"
         y_title = "Expected Return (% do CDI)"
+        final_title = "Retorno (% do CDI)"
     else:
         y_col = f"Smoothed Expected Return (% do CDI) (w={vis_w})"
         low_col = f"Smoothed Lower Bound (% do CDI) (w={vis_w})"
         high_col = f"Smoothed Upper Bound (% do CDI) (w={vis_w})"
         y_title = "Expected Return (% do CDI) — suavizado"
+        final_title = "Retorno (% do CDI) — suavizado"
 else:
     if vis_tipo == "Base":
         y_col = "Expected Return (% a.a.)"
         low_col = "Lower Bound (% a.a.)"
         high_col = "Upper Bound (% a.a.)"
         y_title = "Expected Return (% a.a.)"
+        final_title = "Retorno esperado (% a.a.)"
     else:
         y_col = f"Smoothed Expected Return (% a.a.) (w={vis_w})"
         low_col = f"Smoothed Lower Bound (% a.a.) (w={vis_w})"
         high_col = f"Smoothed Upper Bound (% a.a.) (w={vis_w})"
         y_title = "Expected Return (% a.a.) — suavizado"
+        final_title = "Retorno esperado (% a.a.) — suavizado"
 
-# barras
 bar_base = res_vis[["CDI Range (% a.a.)", "_range_order", "Carteira", y_col]].copy()
 bar_base = bar_base.rename(columns={
     "CDI Range (% a.a.)": "cdi_range",
@@ -569,6 +639,21 @@ for carteira in carteira_order:
         ic_label=ic_level_label,
         cdi_esperado_pct=float(cdi_esperado_pct),
     )
+
+# =========================
+# 3) GRÁFICO FINAL: 3 LINHAS JUNTAS (sem IC)
+# =========================
+st.divider()
+st.subheader("Comparativo — 3 carteiras na mesma curva (sem IC)")
+
+plot_all_three_lines_no_ic(
+    res_bins=res_vis,
+    x_col="CDI Midpoint (% a.a.)",
+    y_col=y_col,
+    title=f"Conservador vs Moderado vs Agressivo — {final_title}{label_suffix}",
+    yaxis_title=y_title,
+    cdi_esperado_pct=float(cdi_esperado_pct),
+)
 
 with st.expander("Diagnóstico (regime filtrado): colunas anuais usadas"):
     cols_diag = ["CDIAcumuladoAnual", "SelicAnualizada", "SelicTrend"] + [f"FatorAnual_{n}" for n in carteira_order]
